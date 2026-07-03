@@ -31,6 +31,7 @@ Before static pods, if the kubelet crashed, you had no way to self-heal the cont
 **Deep-Dive Mechanics**
 
 Location: */etc/kubernetes/manifests/*
+
 The kubelet has a *--pod-manifest-path* (or *staticPodPath* in *kubelet-config.yaml*) pointing to this directory. It polls this directory and creates/deletes pods based on what's there. These pods appear in *kubectl get pods -n kube-system* as mirror pods (read-only representations), but they are owned by the node, not the scheduler.
 
 **The 4 static pod manifests:**
