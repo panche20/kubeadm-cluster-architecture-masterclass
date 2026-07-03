@@ -20,6 +20,73 @@ kubectl → kube-apiserver (authn/authz/admission) → etcd (persist)
    CNI plugin (wire up pod networking)
 ```
 
+## What happens when you run kubectl apply -f manifest.yaml?
+
+When you run kubectl apply -f manifest.yaml, Kubernetes transforms your declarative text file into a live, running infrastructure component. 
+This lifecycle spans three major environments: *the client machine, the control plane, and the worker nodes.*
+The exact sequence of operations occurs in the following order:
+
+**Phase 1: Client-Side Preparation (The kubectl Binary)** 
+
+Before any data reaches your cluster, your local command-line interface processes the instructions:
+
+- Local Validation: kubectl parses your YAML syntax. It downloads the cluster's OpenAPI schema to ensure your resource names and properties are valid.
+- Serialization: The validated YAML is converted into a standard JSON payload.
+- HTTP Request: The client targets your active context (defined in your kubeconfig file) and dispatches an asynchronous HTTPS request to the cluster.
+
+**Phase 2: The Control Plane (The kube-apiserver Doorway)**
+
+The kube-apiserver acts as the front gate for the cluster, routing the payload through three foundational security and structural gates:
+
+[Incoming Request] ──> [1. Authentication] ──> [2. Authorization] ──> [3. Admission Control] ──> [etcd Storage]
+
+**Authentication:**
+
+The cluster determines your identity via client certificates, bearer tokens, or OIDC identity providers.
+
+**Authorization:**
+
+The server evaluates Role-Based Access Control (RBAC) rules to see if your identity has permissions to create or update that resource.
+
+**Admission Control:** 
+
+Special plugins inspect the request. *Mutating Admission Controllers* can change your manifest (e.g., automatically injecting sidecar containers or storage defaults). 
+*Validating Admission Controllers* run a final policy check (e.g., verifying you aren't pulling from an unapproved image registry).
+
+**Phase 3: The Reconciliation Magic & State Storage**
+
+Once passed, Kubernetes must decide whether to create a new resource or update an existing one: 
+
+*The Three-Way Merge*: 
+
+If the resource already exists, Kubernetes computes the exact changes using a three-way merge. It compares the Local Object Config (your current YAML), the Live Object State (what is actively running), and the Last-Applied Configuration (saved as a JSON string inside the object's metadata.annotations array). This prevents your team's manual changes from being accidentally overwritten.
+
+*Server-Side Apply (SSA)*
+
+: In modern clusters, this tracking shifts to the server via managedFields. It explicitly monitors which tool (Helm, Argo CD, or kubectl) owns specific properties, triggering warnings if automated updates conflict.
+
+*Persisting to etcd*: 
+
+The cluster writes the calculated configuration into etcd, the distributed key-value storage system. The moment it saves to etcd, the API server responds to your terminal with deployment.apps/my-app configured (or created).
+
+**Phase 4: Pod Scheduling and Node Deployment**
+
+Even though your command line has finished execution, the cluster is still working in the background to fulfill your intent:
+
+*Controller Reconciliation*: 
+
+The kube-controller-manager notices the etcd change via a streaming watch. If you applied a Deployment, the Deployment Controller builds a ReplicaSet, which subsequently spins up Pod objects with a status of Pending.
+
+*Scheduling*: 
+
+The kube-scheduler discovers these unassigned Pods. It screens the physical resource demands (CPU/Memory), filters healthy nodes, and assigns each Pod to the most optimal host by updating its nodeName field.
+
+*Local Node Execution*: 
+
+The kubelet agent living on the chosen worker node notices the assignment. It interacts with the local Container Runtime (such as containerd or CRI-O) via the Container Runtime Interface. The runtime pulls the necessary images, spins up the Linux namespaces, and launches the container processes.
+
+*Status Updates*: The kubelet monitors the health probes of the container and pushes the Running phase update back to the API server, which records the live status in etcd.
+
 *Everything in your cluster exists to serve this loop.*
 
 ## Phase 1: Control Plane Static Pod Manifests
