@@ -223,3 +223,459 @@ command:
 - --snapshot-count=10000
 - --trusted-ca-file=/etc/kubernetes/pki/etcd/ca.crt
 ```
+
+**Port breakdown:**
+
+- 2379 — Client port (kube-apiserver talks here)
+- 2380 — Peer port (etcd members talk to each other — Raft protocol)
+- 2381 — Metrics port (Prometheus scrapes here)
+
+## Phase 2: etcd Internals — The Brain
+
+**The Why**
+
+Before etcd, distributed systems struggled with consistent shared state. etcd solves the consensus problem: "How do multiple nodes agree on the same value when any of them can fail?"
+
+**Deep-Dive Mechanics: Raft Consensus**
+
+etcd uses the *Raft algorithm*. Here's exactly what happens when kube-apiserver writes a pod object:
+
+```
+1. apiserver sends write to etcd leader
+2. Leader appends entry to its log (not committed yet)
+3. Leader sends AppendEntries RPC to all followers in parallel
+4. Each follower appends to its log, sends ACK
+5. Once (N/2 + 1) nodes ACK → leader marks entry committed
+6. Leader applies to state machine, responds to apiserver
+7. Leader notifies followers to commit on next heartbeat
+```
+
+**Quorum math — the most important thing to know:**
+
+<img width="877" height="255" alt="image" src="https://github.com/user-attachments/assets/0332994c-8321-4ce2-8225-962d9a736a12" />
+
+**Why odd numbers? Even numbers don't increase fault tolerance and cost more**. 4-node etcd tolerates only 1 failure (same as 3-node) but costs an extra node.
+
+**etcd data storage:**
+
+All Kubernetes objects are stored under /registry/ in etcd. You can inspect raw etcd data:
+
+```
+ETCDCTL_API=3 etcdctl \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/peer.crt \
+  --key=/etc/kubernetes/pki/etcd/peer.key \
+  get /registry/pods/default/my-pod \
+  --prefix --keys-only
+
+# Decode the value (protobuf encoded)
+get /registry/pods/default/my-pod | auger decode
+```
+
+**etcd storage key structure:**
+
+```
+/registry/pods/<namespace>/<name>
+/registry/deployments/<namespace>/<name>
+/registry/secrets/<namespace>/<name>
+/registry/configmaps/<namespace>/<name>
+/registry/services/specs/<namespace>/<name>
+/registry/clusterroles/<name>
+/registry/namespaces/<name>
+```
+
+**Backup and Restore (CKA critical):**
+
+```
+# Backup
+ETCDCTL_API=3 etcdctl snapshot save /backup/etcd-snapshot.db \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/peer.crt \
+  --key=/etc/kubernetes/pki/etcd/peer.key
+
+# Verify
+etcdctl snapshot status /backup/etcd-snapshot.db -w table
+
+# Restore (on all control plane nodes)
+etcdctl snapshot restore /backup/etcd-snapshot.db \
+  --data-dir=/var/lib/etcd-restore \
+  --initial-cluster=master1=https://10.0.1.10:2380 \
+  --initial-cluster-token=etcd-cluster-restored \
+  --initial-advertise-peer-urls=https://10.0.1.10:2380 \
+  --name=master1
+
+# Update etcd.yaml --data-dir and --initial-cluster-token to match
+# Then restart kubelet
+```
+
+**Compaction and Defragmentation:**
+
+etcd keeps history of all revisions. Without compaction, it grows unboundedly:
+
+```
+# Compact to current revision
+rev=$(etcdctl endpoint status --write-out=json | jq '.[] | .Status.header.revision')
+etcdctl compact $rev
+
+# Defragment (reclaims disk space)
+etcdctl defrag --cluster
+
+# Check DB size
+etcdctl endpoint status -w table
+```
+
+**Phase 3: The PKI Certificate Infrastructure**
+
+*The Why*
+
+Every component in Kubernetes communicates over mTLS. Without this, any process on any node could impersonate the API server or etcd. The PKI is the trust foundation.
+
+**Deep-Dive: The Complete Certificate Map**
+
+```
+/etc/kubernetes/pki/
+├── ca.crt / ca.key                    # Kubernetes CA (root of trust)
+├── apiserver.crt / apiserver.key      # API server TLS serving cert
+├── apiserver-kubelet-client.crt/key   # apiserver → kubelet (client cert)
+├── apiserver-etcd-client.crt/key      # apiserver → etcd (client cert)
+├── front-proxy-ca.crt/key             # Front proxy CA (aggregation layer)
+├── front-proxy-client.crt/key         # Aggregation layer client
+├── sa.pub / sa.key                    # Service Account signing key pair
+└── etcd/
+    ├── ca.crt / ca.key               # etcd-specific CA
+    ├── server.crt / server.key       # etcd server TLS
+    ├── peer.crt / peer.key           # etcd peer-to-peer
+    └── healthcheck-client.crt/key    # liveness probe client
+```
+
+**Who presents which cert to whom:**
+
+```
+kubelet → apiserver:        kubelet uses its node client cert (CN=system:node:<hostname>)
+apiserver → etcd:           apiserver-etcd-client.crt
+apiserver → kubelet:        apiserver-kubelet-client.crt (CN=kubernetes, O=system:masters)
+controller-manager → api:   controller-manager.conf (embedded client cert)
+scheduler → api:            scheduler.conf (embedded client cert)
+kubectl → api:              admin.conf (embedded client cert, O=system:masters)
+```
+
+**Certificate Rotation:**
+
+```
+# Check expiry
+kubeadm certs check-expiration
+
+# Rotate all control plane certs
+kubeadm certs renew all
+
+# Rotate specific cert
+kubeadm certs renew apiserver
+
+# After renewal, restart static pods by moving/restoring manifests
+# OR: kill the static pod process; kubelet will restart it
+```
+
+**Gotcha:**
+
+After cert renewal, the kubeconfig files under /etc/kubernetes/*.conf also need to be regenerated because they embed client certs. 
+Kubeadm certs renew handles this but you need to copy the new admin.conf to ~/.kube/config.
+
+**Phase 4: The Kubeconfig Files**
+
+These are how each component authenticates to the API server:
+
+```
+/etc/kubernetes/
+├── admin.conf            # kubectl (O=system:masters → cluster-admin)
+├── controller-manager.conf
+├── scheduler.conf
+└── kubelet.conf          # Per-node (CN=system:node:<nodename>)
+```
+
+**Structure of each kubeconfig:**
+
+```
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    certificate-authority-data: <base64 ca.crt>
+    server: https://10.0.1.100:6443    # VIP for HA clusters
+  name: kubernetes
+users:
+- name: kubernetes-admin
+  user:
+    client-certificate-data: <base64 client.crt>
+    client-key-data: <base64 client.key>
+contexts:
+- context:
+    cluster: kubernetes
+    user: kubernetes-admin
+  name: kubernetes-admin@kubernetes
+current-context: kubernetes-admin@kubernetes
+```
+
+**In an HA cluster the server here points to the Load Balancer VIP or NLB DNS, not an individual node. This is a common exam gotcha.**
+
+**Phase 5: kubelet — The Node Agent**
+
+*The Why*
+
+Something must translate the API server's desired state (PodSpec) into actual running containers on the node. That's kubelet. It's the only component that runs as a systemd service, not a static pod.
+
+**Deep-Dive: kubelet Configuration**
+
+*Service definition:*
+
+```
+/etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+```
+
+```
+[Service]
+Environment="KUBELET_KUBECONFIG_ARGS=--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
+Environment="KUBELET_CONFIG_ARGS=--config=/var/lib/kubelet/config.yaml"
+EnvironmentFile=-/var/lib/kubelet/kubeadm-flags.env
+EnvironmentFile=-/etc/default/kubelet
+ExecStart=
+ExecStart=/usr/bin/kubelet $KUBELET_KUBECONFIG_ARGS $KUBELET_CONFIG_ARGS $KUBELET_KUBEADM_ARGS $KUBELET_EXTRA_ARGS
+```
+
+**The main config file** /var/lib/kubelet/config.yaml:
+
+```
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+authentication:
+  anonymous:
+    enabled: false
+  webhook:
+    enabled: true         # Delegates authn to apiserver
+authorization:
+  mode: Webhook           # Delegates authz to apiserver
+clusterDNS:
+- 10.96.0.10             # CoreDNS Service ClusterIP
+clusterDomain: cluster.local
+containerRuntimeEndpoint: unix:///var/run/containerd/containerd.sock
+staticPodPath: /etc/kubernetes/manifests   # THIS is how static pods work
+evictionHard:
+  memory.available: "100Mi"
+  nodefs.available: "10%"
+  imagefs.available: "15%"
+maxPods: 110
+podCIDR: 192.168.1.0/24   # Assigned by controller-manager per node
+rotateCertificates: true
+serverTLSBootstrap: true
+cgroupDriver: systemd      # MUST match containerd's cgroupDriver
+```
+
+**/var/lib/kubelet/kubeadm-flags.env:**
+
+```
+KUBELET_KUBEADM_ARGS="--container-runtime-endpoint=unix:///var/run/containerd/containerd.sock --pod-infra-container-image=registry.k8s.io/pause:3.9"
+```
+
+**kubelet reconciliation loop:**
+
+```
+1. Watch apiserver for pods assigned to this node (spec.nodeName == self)
+2. For each pod:
+   a. Ensure pause (infra) container running → sets up network namespace
+   b. CNI plugin called → assigns pod IP, sets up veth pair
+   c. Init containers run to completion (ordered)
+   d. App containers start
+   e. Liveness/Readiness probes start
+3. Report pod status back to apiserver
+4. Enforce resource limits via cgroups v2
+5. Garbage collect old images and dead containers
+```
+
+**Node Bootstrap Flow (first join):**
+
+```
+1. kubelet starts with bootstrap-kubelet.conf (has a bootstrap token)
+2. kubelet creates a CertificateSigningRequest for a node client cert
+3. controller-manager's CSR approver auto-approves (if NodeBootstrapper RBAC is set)
+4. kubelet gets its cert, writes kubelet.conf, discards bootstrap token
+```
+
+**Phase 6: kube-proxy — Service Routing**
+
+*Deep-Dive*
+
+kube-proxy runs as a DaemonSet (not a static pod). It watches the apiserver for Service and Endpoint changes and programs the node's packet filter.
+
+```
+kubectl get daemonset -n kube-system kube-proxy
+kubectl get configmap -n kube-system kube-proxy -o yaml
+```
+
+**The ConfigMap:**
+
+```
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kube-proxy
+  namespace: kube-system
+data:
+  config.conf: |
+    apiVersion: kubeproxy.config.k8s.io/v1alpha1
+    kind: KubeProxyConfiguration
+    mode: "ipvs"              # iptables | ipvs | nftables
+    ipvs:
+      scheduler: "rr"         # rr | lc | dh | sh | sed | nq
+    clusterCIDR: "192.168.0.0/16"
+    iptables:
+      masqueradeAll: false
+```
+
+**iptables mode (default in older clusters):**
+
+```
+# How a ClusterIP Service actually works
+iptables -t nat -L KUBE-SERVICES -n    # Entry point for all Service traffic
+iptables -t nat -L KUBE-SVC-XXXX -n   # Per-service chain (probabilistic load balancing)
+iptables -t nat -L KUBE-SEP-XXXX -n   # Per-endpoint (DNAT to pod IP)
+```
+
+Every packet to ClusterIP goes: KUBE-SERVICES → KUBE-SVC-* → random KUBE-SEP-* → DNAT to pod IP.
+
+**IPVS mode (preferred for >1000 services):**
+
+```
+ipvsadm -Ln          # Show virtual servers and real servers
+```
+
+IPVS uses a hash table (O(1) lookup) vs iptables' linear chain (O(n) lookup). Critical for large clusters.
+
+*Gotcha*: 
+
+kube-proxy doesn't handle pod-to-pod routing. That's the CNI's job. kube-proxy only handles Service VIP → pod IP translation.
+
+**Phase 7: CNI Plugin — Pod Networking**
+
+*Deep-Dive*
+
+```
+/etc/cni/net.d/          # CNI config files (kubeadm leaves this to you)
+/opt/cni/bin/            # CNI plugin binaries
+```
+
+**What happens when kubelet creates a pod:**
+
+```
+1. kubelet creates pod network namespace: /var/run/netns/<pod-uid>
+2. pause container starts, enters this netns
+3. kubelet calls CNI plugin (via exec): /opt/cni/bin/calico (or flannel, etc.)
+4. CNI plugin:
+   a. Creates veth pair: eth0 (in pod netns) ↔ cali<hash> (on host)
+   b. Assigns IP from the node's pod CIDR
+   c. Sets up routes
+5. Pod's eth0 has its IP, can communicate
+
+Cross-node routing (Calico IPIP example):
+Pod A (node1) → cali<x> → IPIP tunnel → cali<y> → Pod B (node2)
+```
+
+**Calico DaemonSet watches:**
+
+```
+kubectl get daemonset -n calico-system calico-node
+kubectl get pod -n calico-system -l app=calico-node
+```
+
+**Phase 8: CoreDNS — Service Discovery**
+
+*Deep-Dive*
+
+```
+kubectl get deployment -n kube-system coredns
+kubectl get configmap -n kube-system coredns -o yaml
+```
+
+**The Corefile:**
+
+```
+.:53 {
+    errors
+    health {
+       lameduck 5s
+    }
+    ready
+    kubernetes cluster.local in-addr.arpa ip6.arpa {
+       pods insecure
+       fallthrough in-addr.arpa ip6.arpa
+       ttl 30
+    }
+    prometheus :9153
+    forward . /etc/resolv.conf {        # Upstream DNS (AWS Route 53)
+       max_concurrent 1000
+    }
+    cache 30
+    loop
+    reload
+    loadbalance
+}
+```
+
+**DNS resolution path for a pod:**
+
+```
+Pod makes DNS query → /etc/resolv.conf → nameserver 10.96.0.10 (CoreDNS ClusterIP)
+  → CoreDNS checks kubernetes plugin
+  → "my-svc.my-ns.svc.cluster.local" → returns ClusterIP
+  → "external.com" → forwards to upstream (/etc/resolv.conf on node → AWS VPC DNS)
+```
+
+**Pod's /etc/resolv.conf (injected by kubelet):**
+
+```
+nameserver 10.96.0.10
+search default.svc.cluster.local svc.cluster.local cluster.local
+options ndots:5
+```
+
+*The ndots:5 gotcha: *
+
+Any name with fewer than 5 dots gets search domain appended first, causing latency. curl google.com → tries google.com.default.svc.cluster.local first (fails), then google.com.svc.cluster.local (fails), then google.com.cluster.local (fails), then google.com (succeeds). Fix: use google.com. (trailing dot) or set ndots:1 in pod dnsConfig.
+
+**Phase 9: HA-Specific Infrastructure**
+
+*The Load Balancer / VIP Layer*
+
+In your AWS EC2 HA setup, traffic to port 6443 must be distributed across all 3 API servers. You have two approaches:
+
+**Option A: HAProxy + Keepalived (self-managed VIP)**
+
+```
+/etc/haproxy/haproxy.cfg:
+
+frontend kubernetes-frontend
+    bind *:6443
+    mode tcp
+    default_backend kubernetes-backend
+
+backend kubernetes-backend
+    mode tcp
+    balance roundrobin
+    option tcp-check
+    server master1 10.0.1.10:6443 check fall 3 rise 2
+    server master2 10.0.1.11:6443 check fall 3 rise 2
+    server master3 10.0.1.12:6443 check fall 3 rise 2
+```
+
+Keepalived provides the floating VIP. If the HAProxy node fails, VIP migrates.
+
+**Option B: AWS NLB (your actual setup)**
+
+```
+NLB (10.0.1.100 or DNS) → target group:
+  - 10.0.1.10:6443
+  - 10.0.1.11:6443
+  - 10.0.1.12:6443
+(health check: TCP:6443)
+```
+
