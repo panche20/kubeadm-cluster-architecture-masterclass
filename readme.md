@@ -43,3 +43,55 @@ The kubelet has a *--pod-manifest-path* (or *staticPodPath* in *kubelet-config.y
 ├── kube-scheduler.yaml
 └── etcd.yaml
 ```
+
+**1a. kube-apiserver.yaml — Deep Dive**
+
+```
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-apiserver
+  namespace: kube-system
+spec:
+  containers:
+  - name: kube-apiserver
+    image: registry.k8s.io/kube-apiserver:v1.29.x
+    command:
+    - kube-apiserver
+    # === AUTHENTICATION ===
+    - --client-ca-file=/etc/kubernetes/pki/ca.crt
+    - --tls-cert-file=/etc/kubernetes/pki/apiserver.crt
+    - --tls-private-key-file=/etc/kubernetes/pki/apiserver.key
+    # === AUTHORIZATION ===
+    - --authorization-mode=Node,RBAC
+    # === ETCD CONNECTION ===
+    - --etcd-servers=https://127.0.0.1:2379
+    - --etcd-cafile=/etc/kubernetes/pki/etcd/ca.crt
+    - --etcd-certfile=/etc/kubernetes/pki/apiserver-etcd-client.crt
+    - --etcd-keyfile=/etc/kubernetes/pki/apiserver-etcd-client.key
+    # === ADMISSION ===
+    - --enable-admission-plugins=NodeRestriction
+    # === SERVICE NETWORK ===
+    - --service-cluster-ip-range=10.96.0.0/12
+    # === HA SPECIFIC ===
+    - --advertise-address=<THIS_NODE_IP>
+    - --etcd-servers=https://etcd1:2379,https://etcd2:2379,https://etcd3:2379
+    # === AUDIT ===
+    - --audit-log-path=/var/log/kubernetes/audit.log
+    - --audit-policy-file=/etc/kubernetes/audit-policy.yaml
+    volumeMounts:
+    - mountPath: /etc/kubernetes/pki
+      name: k8s-certs
+      readOnly: true
+    - mountPath: /etc/ssl/certs
+      name: ca-certs
+      readOnly: true
+  hostNetwork: true          # Uses node network namespace
+  priorityClassName: system-node-critical
+  volumes:
+  - hostPath:
+      path: /etc/kubernetes/pki
+    name: k8s-certs
+```
+
+
