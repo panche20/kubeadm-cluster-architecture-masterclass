@@ -492,6 +492,103 @@ current-context: kubernetes-admin@kubernetes
 
 Something must translate the API server's desired state (PodSpec) into actual running containers on the node. That's kubelet. It's the only component that runs as a systemd service, not a static pod.
 
+There are two different *kubelet configuration files* in a kubeadm cluster, and it's easy to confuse them.
+
+ **- /var/lib/kubelet/config.yaml -- Most Important**
+
+This is the active kubelet configuration used by the kubelet service on each node. Location is:
+
+```
+sudo cat /var/lib/kubelet/config.yaml
+```
+
+You'll see setting such as :
+- authentication
+- authorization
+- clusterDNS
+- clusterDomain
+- cgroupDriver
+- resolvConf
+- staticPodPath
+- rotateCertificates
+
+*This is the file kubelet reads when it starts.*
+
+**/etc/kubernetes/kubelet.conf**
+
+This is not the kubelet configuration. It is the kubeconfig that kubelet uses to authenticate to the API server.
+
+Location:
+
+```
+/etc/kubernetes/kubelet.conf
+```
+
+It contains:
+
+- API server endpoint
+- client certificate
+- client key
+- cluster CA certificate
+
+Think of it as kubelet's "login credentials."
+
+**kubelet-config.yaml** - *ConfigMap*
+
+After kubeadm init, kubeadm uploads the kubelet configuration into the cluster as a ConfigMap.
+You can view it with:
+
+```
+kubectl get configmap -n kube-system
+
+Look for something similar to:
+kubelet-config
+
+To inspect it:
+kubectl get configmap kubelet-config -n kube-system -o yaml
+```
+
+**How kubeadm creates the kubelet configuration**
+
+During kubeadm init:
+
+- kubeadm generates the kubelet configuration.
+- It writes it locally to:
+
+```
+/var/lib/kubelet/config.yaml
+```
+- It uploads the same configuration to the cluster as the kubelet-config ConfigMap.
+- The kubelet service starts using that configuration.
+
+**Verify what kubelet is actually using**
+
+```
+sudo systemctl cat kubelet
+```
+
+You'll see something similar to:
+
+```
+ExecStart=/usr/bin/kubelet \
+  --config=/var/lib/kubelet/config.yaml \
+  --kubeconfig=/etc/kubernetes/kubelet.conf \
+  --container-runtime-endpoint=unix:///var/run/containerd/containerd.sock
+```
+
+This tells you exactly which configuration file and kubeconfig the kubelet is using.
+
+**Interview tip**
+
+*A common interview question is:*
+
+What's the difference between /var/lib/kubelet/config.yaml and /etc/kubernetes/kubelet.conf?
+
+**A strong answer is:**
+
+- /var/lib/kubelet/config.yaml contains the kubelet's runtime configuration (DNS, cgroup driver, authentication settings, static pod path, etc.).
+- /etc/kubernetes/kubelet.conf is a kubeconfig file that contains the API server endpoint and client credentials the kubelet uses to authenticate to the Kubernetes API server.
+
 **Deep-Dive: kubelet Configuration**
 
 *Service definition:*
