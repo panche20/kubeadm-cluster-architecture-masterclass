@@ -48,6 +48,149 @@ nodeRegistration:
   criSocket: unix:///var/run/containerd/containerd.sock
 ```
 
+It's an input configuration file that you create yourself before running kubeadm init.
+
+**Where does kubeadm store this configuration after initialization?**
+
+Although the input file doesn't exist anymore, kubeadm uploads the cluster configuration into the cluster as ConfigMaps.
+
+**1. ClusterConfiguration**
+
+```
+kubectl get configmap -n kube-system kubeadm-config -o yaml
+```
+
+You will see something like this:
+
+```
+apiVersion: v1
+kind: ConfigMap
+
+data:
+
+  ClusterConfiguration: |
+    apiVersion: kubeadm.k8s.io/v1beta4
+    kind: ClusterConfiguration
+    kubernetesVersion: v1.33.1
+    networking:
+      podSubnet: 192.168.0.0/16
+      serviceSubnet: 10.96.0.0/12
+```
+This is the configuration that kubeadm stored after initialization.
+
+**2. View only the ClusterConfiguration**
+
+```
+kubectl get cm kubeadm-config \
+-n kube-system \
+-o jsonpath='{.data.ClusterConfiguration}'
+```
+
+**3. InitConfiguration**
+
+This surprises many people. kubeadm does NOT store the complete InitConfiguration in the ConfigMap.
+
+Why?
+
+Because InitConfiguration contains machine-specific information, such as:
+
+- advertiseAddress
+- nodeRegistration
+- CRI socket
+- bootstrap settings
+
+Those values only matter while initializing the first control plane node.
+Once initialization completes, they are no longer needed for cluster-wide configuration.
+
+**Where can I find those values now?**
+
+For your cluster:
+
+**API Server advertise address**
+
+Look at the API server manifest:
+
+```
+sudo cat /etc/kubernetes/manifests/kube-apiserver.yaml
+You'll find something like:
+
+- --advertise-address=172.31.41.127
+```
+
+**CRI socket**
+
+```
+sudo systemctl cat kubelet
+
+You'll see:
+--container-runtime-endpoint=unix:///var/run/containerd/containerd.sock
+```
+
+**Local API Endpoint**
+
+Also visible in:
+
+```
+sudo cat /etc/kubernetes/manifests/kube-apiserver.yaml
+
+sudo kubeadm config view
+```
+
+**What if I had initialized using a config file?**
+Suppose you had created:
+
+```
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+...
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+...
+```
+
+and then run:
+
+```
+sudo kubeadm init --config kubeadm-config.yaml
+```
+
+The file would simply remain wherever you saved it, for example:
+
+```
+/home/ubuntu/kubeadm-config.yaml
+```
+
+or
+
+```
+/root/kubeadm-config.yaml
+```
+
+kubeadm does not copy it to /etc/kubernetes.
+
+**Verify on your cluster**
+
+Run these commands:
+
+```
+kubectl get cm kubeadm-config -n kube-system -o yaml
+sudo cat /etc/kubernetes/manifests/kube-apiserver.yaml
+sudo cat /var/lib/kubelet/config.yaml
+```
+
+Together, these three locations contain almost everything that was specified during your kubeadm init.
+
+**Interview insight**
+
+One subtle but important point for interviews is the distinction between configuration used to create the cluster and configuration the running cluster retains:
+
+- InitConfiguration: Used once during kubeadm init; it describes how to bootstrap the first control-plane node and is generally not persisted because it's node-specific.
+- ClusterConfiguration: Represents cluster-wide settings (network CIDRs, API server configuration, etc.) and is persisted in the kube-system/kubeadm-config ConfigMap so that future operations like upgrades can reuse it.
+
+Understanding this lifecycle demonstrates that you know not just what kubeadm config contains, but why different pieces are stored differently.
+
+
 **Adding a second control-plane node — the part most engineers can't explain:**
 
 The kubeadm-certs Secret holds your entire PKI tree, encrypted at rest with a one-time symmetric key (--certificate-key). 
