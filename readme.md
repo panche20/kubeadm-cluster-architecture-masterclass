@@ -843,3 +843,118 @@ NLB (10.0.1.100 or DNS) → target group:
 (health check: TCP:6443)
 ```
 
+All kubeconfigs point to the NLB DNS name. This is cloud-native, no Keepalived needed.
+
+**Stacked etcd vs External etcd**
+
+*Stacked (kubeadm default)*: etcd runs on the same nodes as control plane components. 3 control plane nodes = 3 etcd members. Simpler but if a node goes down, you lose both a control plane instance AND an etcd member.
+
+*External etcd*: Separate dedicated etcd cluster (3-5 nodes). Control plane nodes only run apiserver/KCM/scheduler. More resilient, more nodes, more cost.
+
+```
+Stacked: 3 control plane nodes (each runs: apiserver + KCM + scheduler + etcd)
+External: 3 control plane nodes + 3-5 dedicated etcd nodes
+```
+
+**Phase 10: Critical ConfigMaps and Bootstrap RBAC**
+
+*kubeadm-config ConfigMap*
+
+```
+kubectl get configmap -n kube-system kubeadm-config -o yaml
+```
+
+This stores the ClusterConfiguration used to bootstrap the cluster. kubeadm reads this when adding nodes or upgrading.
+
+**kube-system ConfigMaps to know:**
+
+```
+kubectl get cm -n kube-system
+
+NAME                                 DATA
+coredns                              1      # Corefile
+kube-proxy                           2      # kube-proxy config
+kubeadm-config                       1      # Cluster init config
+kubelet-config                       1      # Kubelet config for new nodes
+extension-apiserver-authentication   6      # CA bundles for aggregation layer
+```
+
+*kubelet-config is how kubeadm join works:*
+
+When a new worker node runs *kubeadm join*, it fetches this ConfigMap and uses it to configure its kubelet. This means you can change cluster-wide kubelet config by updating this ConfigMap and re-joining nodes (or using *kubeadm upgrade node*).
+
+## Phase 11: Interview POV & Gotchas
+
+*Common Staff-Level Interview Questions:*
+
+**Q: A pod is stuck in Pending. Walk me through your investigation.**
+
+```
+1. kubectl describe pod → check Events section
+2. Scheduling failed?
+   - Insufficient resources → kubectl describe node, check Allocatable vs Requests
+   - Taint not tolerated → kubectl describe node | grep Taint
+   - NodeSelector/Affinity mismatch → check spec
+3. PVC not bound? → kubectl describe pvc
+4. No nodes? → kubectl get nodes
+5. Scheduler down? → kubectl get pod -n kube-system | grep scheduler
+```
+
+**Q: etcd has lost quorum. What do you do?**
+
+```
+1. Determine how many members are down
+2. If can recover majority: restart failed etcd processes
+3. If cannot recover quorum:
+   a. Stop all remaining etcd members
+   b. On one surviving member: etcd --force-new-cluster
+   c. This creates a new single-member cluster from last known state
+   d. Add other members back one by one
+   e. Or: restore from snapshot to all nodes
+```
+
+**Q: Explain the difference between a Node being NotReady vs a node being Unschedulable.**
+
+- NotReady: kubelet stopped heartbeating to apiserver (kubelet crashed, network partition). Controller-manager will evict pods after pod-eviction-timeout.
+- Unschedulable: Node has spec.unschedulable: true (via kubectl cordon). Node is healthy, pods run fine, but no new pods will be scheduled there. Used during node maintenance.
+
+**Q: How does a new worker node join an HA cluster?**
+
+```
+1. kubeadm token create --print-join-command (on control plane)
+2. On worker: kubeadm join <VIP>:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash>
+3. Worker kubelet bootstraps using the token
+4. CSR created and approved
+5. Worker gets kubelet.conf with its node cert
+6. Control plane components recognize the new node
+```
+
+**Key Gotchas for CKA:**
+
+- Modifying static pod flags → edit the file in /etc/kubernetes/manifests/, kubelet auto-restarts. Don't use kubectl edit for static pods — it edits the mirror pod which doesn't persist.
+- etcd restore requires consistent --initial-cluster-token across all nodes in the restored cluster. If you restore with a different token than the running cluster, members won't peer.
+- --cgroup-driver mismatch between kubelet and containerd is the #1 cause of nodes failing to start after kernel upgrades. Both must be systemd on modern systems.
+- service-cluster-ip-range is immutable after cluster creation. Changing it requires rebuilding the cluster.
+- kubeadm upgrade order is strictly: etcd → apiserver → KCM → scheduler → kubelet (control plane) → kubelet (workers). Never upgrade workers before control plane.
+
+## Phase 12: The Evolution — What Comes After kubeadm?
+
+<img width="922" height="445" alt="image" src="https://github.com/user-attachments/assets/b5477cfb-8a9d-4f2f-97f1-04fa486034c5" />
+
+*Cluster API* is the current production standard for fleet management — you define Cluster, MachineDeployment, etc. objects and CAPI controllers provision and manage them on any cloud or bare metal.
+
+**Your Study Priority Order**
+
+```
+Week 1: etcd internals + backup/restore (highest CKA weight)
+Week 1: Certificate PKI — understand every cert's purpose and path
+Week 2: kubelet config — every flag, static pod path, cgroupDriver
+Week 2: kube-apiserver flags — auth modes, admission, service CIDR
+Week 3: Scheduling — filtering/scoring pipeline, affinity, taints
+Week 3: HA mechanics — leader election, NLB/HAProxy, quorum
+Week 4: Operational — upgrade process, node operations, troubleshooting flows
+```
+
+**The pattern to recognize**: 
+
+every component either talks to the apiserver or IS the apiserver's dependency (etcd). Once you internalize the cert chain and kubeconfig for each component, the whole system becomes a coherent picture rather than a pile of YAML files.
