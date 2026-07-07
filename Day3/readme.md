@@ -1,5 +1,66 @@
 # Master Lab Guide: etcd Failure and Restore
 
+**Step A: Check your Running ETCD Version**
+
+Run the following command on your master node to inspect the ETCD container image:
+
+```
+kubectl get pod -n kube-system -l component=etcd -o jsonpath='{.items[0].spec.containers[0].image}'
+```
+
+*Expected Output Example:*
+
+```
+registry.k8s.io/etcd:3.5.21-0
+```
+
+**Step B: Decide the Utility Version**
+You should download the etcd release binary that matches the major and minor version of your output (and ideally the exact patch version).
+
+If your cluster runs 3.5.15, set ETCD_VER=v3.5.15.
+
+If your cluster runs 3.6.2, set ETCD_VER=v3.6.2.
+
+⚠️ Important Architecture Note for etcdutl:
+The separate etcdutl binary was introduced in ETCD v3.6.
+
+If your version is v3.6+: You will have two distinct binaries (etcdctl and etcdutl).
+
+If your version is v3.5 or older: etcdutl does not exist as a separate file. Instead, etcdctl handles everything (including restores).
+
+**Install etcdctl for v3.5.21**
+
+Run this on your master node to download and install the exact matching version:
+
+```
+# Set version to match your pod
+ETCD_VER=v3.5.21
+
+# Download and extract the archive
+curl -LO https://github.com/etcd-io/etcd/releases/download/${ETCD_VER}/etcd-${ETCD_VER}-linux-amd64.tar.gz
+tar xzvf etcd-${ETCD_VER}-linux-amd64.tar.gz
+
+# Move etcdctl to your system binary path
+sudo mv etcd-${ETCD_VER}-linux-amd64/etcdctl /usr/local/bin/
+
+# Verify the version
+etcdctl version
+
+# Clean up installer files
+rm -rf etcd-${ETCD_VER}-linux-amd64*
+```
+
+**Verify ETCD Pod Health**
+
+Before taking a snapshot, let's verify that the ETCD pod is healthy and running.
+
+```
+kubectl get pods -n kube-system -l component=etcd
+```
+
+What to look for: Ensure the status says *Running* and the restarts count is stable.
+
+
 ## Phase 1: Pre-Lab Discovery & Baseline (Do Not Skip)
 
 Before breaking anything, you must discover the exact configuration parameters kubeadm used for your unique cluster.
