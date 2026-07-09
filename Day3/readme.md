@@ -1,5 +1,22 @@
 # Master Lab Guide: etcd Failure and Restore
 
+**Mental Model: What etcd Failure Actually Means**
+
+```
+Single etcd member goes down:
+
+apiserver ──────────────> etcd (DEAD)
+   │                         ✗ no reads
+   │                         ✗ no writes
+   │
+   ├── kubectl get pods      ✗ FAILS (apiserver can't serve)
+   ├── new pod scheduling    ✗ FAILS (scheduler can't write)
+   ├── controller reconcile  ✗ FAILS (KCM can't read/write)
+   │
+   └── EXISTING pods         ✅ KEEP RUNNING
+       (kubelet is autonomous — doesn't need apiserver for already-running pods)
+```
+
 **Step A: Check your Running ETCD Version**
 
 Run the following command on your master node to inspect the ETCD container image:
