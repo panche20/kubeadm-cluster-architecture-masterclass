@@ -84,6 +84,16 @@ Before breaking anything, you must discover the exact configuration parameters k
 
 **1. Extract the Hidden Cluster Variables**
 
+### Verify health of ETCD:
+
+```
+sudo ETCDCTL_API=3 etcdctl endpoint health \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key
+```
+
 Run this command to find your exact etcd member name, host IP, and data directory:
 
 ```
