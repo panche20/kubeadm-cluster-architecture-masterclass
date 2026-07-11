@@ -134,12 +134,15 @@ sudo ETCDCTL_API=3 etcdctl snapshot save /root/etcd-backup-$(date +%F).db \
 sudo ETCDCTL_API=3 etcdctl snapshot status /root/etcd-backup-$(date +%F).db -w table
 ```
 
-**2. Break the Control Plane**
-
-Move the etcd manifest completely out of the static pods folder. Kubelet will instantly kill the container.
+**2. Freeze the Master Management Layer**
 
 ```
-sudo mv /etc/kubernetes/manifests/etcd.yaml /root/etcd.yaml.bak
+# Stop the kubelet daemon
+sudo systemctl stop kubelet
+
+# Force stop the underlying containers so they instantly drop their file locks
+sudo crictl stop $(sudo crictl ps -q --name etcd) 2>/dev/null
+sudo crictl stop $(sudo crictl ps -q --name kube-apiserver) 2>/dev/null
 ```
 
 ## Phase 3: Observe the Blast Radius
@@ -152,21 +155,12 @@ sudo mv /etc/kubernetes/manifests/etcd.yaml /root/etcd.yaml.bak
 
 ## Phase 4: The Atomic Restoration Procedure
 
-**Step 1: Stop the API Server**
-
-To prevent configuration corruption or data conflicts during the swap, remove the API server first:
-
-```
-sudo mv /etc/kubernetes/manifests/kube-apiserver.yaml /root/kube-apiserver.yaml.bak
-sleep 5
-```
-
-**Step 2: Clean the Directory and Run the Restore**
+**Step 1: Clean the Directory and Run the Restore**
 
 Wipe the old directory completely. Then, use the exact Name and IP variables you discovered in Phase 1 to run the restore:
 
 ```
-# 1. Clear out the live database path
+# 1. Corrected step: Remove the directory entirely so etcdctl can re-provision it cleanly
 sudo rm -rf /var/lib/etcd
 
 # 2. Restore using your specific cluster variables
@@ -197,18 +191,13 @@ sudo ls -lh /var/lib/etcd/member/snap/db
 
 ## Phase 5: Sequential Cluster Startup
 
-**1. Bring up etcd First**
+**1. Unfreeze the Master Layer**
 
-Copy your backup manifest file straight back into the active manifests folder:
-
-```
-sudo cp /root/etcd.yaml.bak /etc/kubernetes/manifests/etcd.yaml
-```
-
-Monitor etcd until its status turns back to Running:
+Since we didn't touch or move the manifest files, all you have to do is turn the Kubelet service back on. It will immediately pick up the restored database state:
 
 ```
-watch -n 1 "sudo crictl ps | grep etcd"
+sudo systemctl start kubelet
+sudo systemctl restart kubelet
 ```
 
 *(Press Ctrl+C to exit the watch once it runs).*
@@ -227,16 +216,6 @@ sudo ETCDCTL_API=3 etcdctl endpoint health \
 
 Must Return: ... healthy: successfully committed proposal
 
-**3. Bring up the API Server**
-
-Now that the database is certified healthy, restore the API server manifest:
-
-```
-sudo mv /root/kube-apiserver.yaml.bak /etc/kubernetes/manifests/kube-apiserver.yaml
-```
-
-Wait 20 seconds for the API Server to boot up, parse certificates, and sync its internal RBAC rules.
-
 ## Phase 6: Final Verification
 
 Run these commands in order to confirm full cluster restoration:
@@ -251,6 +230,24 @@ kubectl get pods -n kube-system
 # Run a write test to prove database isn't read-only
 kubectl run recovery-test --image=nginx:alpine
 kubectl delete pod recovery-test
+```
+
+## Phase 7 : Force Networking Plane Reconciliation
+
+Back on the master node, once kubectl get nodes returns a clean Ready status, execute a rolling restart of your cluster's proxy engine and internal DNS routers to align the data plane:
+
+```
+# 1. Refresh Kube-Proxy routing tables
+kubectl rollout restart daemonset kube-proxy -n kube-system
+
+# 2. Refresh internal CoreDNS routing entries
+kubectl rollout restart deployment coredns -n kube-system
+
+# 3. Refresh CNI Engine (Uncomment the one your cluster runs)
+# For Calico:
+# kubectl rollout restart daemonset calico-node -n kube-system
+# For Cilium:
+# kubectl rollout restart daemonset cilium -n kube-system
 ```
 
 ## 💡 Pro-Tip Checklist :
