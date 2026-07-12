@@ -17,6 +17,10 @@ apiserver ──────────────> etcd (DEAD)
        (kubelet is autonomous — doesn't need apiserver for already-running pods)
 ```
 
+*This is the single most important thing to understand: the data plane survives the control plane going blind. 
+Your nginx pods will still serve traffic after etcd dies. 
+Only the ability to observe or change cluster state is lost.*
+
 **Step A: Check your Running ETCD Version**
 
 Run the following command on your master node to inspect the ETCD container image:
