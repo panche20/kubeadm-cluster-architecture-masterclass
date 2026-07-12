@@ -258,6 +258,10 @@ kubectl rollout restart deployment coredns -n kube-system
 # kubectl rollout restart daemonset calico-node -n kube-system
 # For Cilium:
 # kubectl rollout restart daemonset cilium -n kube-system
+
+# Check kubelet's Perspective
+sudo journalctl -u kubelet --since "5 minutes ago" --no-pager | \
+  grep -iE "etcd|error|failed|stopped" | tail -20
 ```
 
 ## 💡 Pro-Tip Checklist :
