@@ -34,16 +34,18 @@ registry.k8s.io/etcd:3.5.21-0
 **Step B: Decide the Utility Version**
 You should download the etcd release binary that matches the major and minor version of your output (and ideally the exact patch version).
 
+```
 If your cluster runs 3.5.15, set ETCD_VER=v3.5.15.
-
 If your cluster runs 3.6.2, set ETCD_VER=v3.6.2.
+```
 
-⚠️ Important Architecture Note for etcdutl:
+*⚠️ Important Architecture Note for etcdutl:*
+
+```
 The separate etcdutl binary was introduced in ETCD v3.6.
-
 If your version is v3.6+: You will have two distinct binaries (etcdctl and etcdutl).
-
 If your version is v3.5 or older: etcdutl does not exist as a separate file. Instead, etcdctl handles everything (including restores).
+```
 
 **Install etcdctl for v3.5.21**
 
