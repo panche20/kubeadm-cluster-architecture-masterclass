@@ -332,7 +332,7 @@ watch sudo crictl ps | grep apiserver
 
 ## Interview Debrief
 
-Q: apiserver is unreachable — how do you determine if it's a cert issue vs etcd issue vs process crash?
+**Q: apiserver is unreachable — how do you determine if it's a cert issue vs etcd issue vs process crash?**
 
 ```
 1. kubectl get nodes → timeout = etcd or network
@@ -344,14 +344,14 @@ Q: apiserver is unreachable — how do you determine if it's a cert issue vs etc
    → tells you immediately if file is valid or garbage
 ```
 
-Q: kubeadm certs renew apiserver — what does this actually do under the hood?
+**Q: kubeadm certs renew apiserver — what does this actually do under the hood?**
 
 It reads the existing CA (ca.crt + ca.key), generates a new RSA key pair, creates a CSR with the correct SANs (pulled from kubeadm-config ConfigMap), signs it with the CA, and writes the new cert + key. The CA itself is NOT touched.
 
-Q: What happens if the CA cert itself expires or is corrupted?
+**Q: What happens if the CA cert itself expires or is corrupted?**
 
 Far more catastrophic — every component's cert becomes unverifiable simultaneously. Recovery requires rebuilding the entire PKI from scratch and re-issuing every cert in the cluster. This is why ca.key should be stored offline in production (HSM or sealed Vault) once the cluster is bootstrapped — it's the nuclear key.
 
-Q: After kubeadm certs renew, what else needs updating?
+**Q: After kubeadm certs renew, what else needs updating?**
 
 The kubeconfig files (admin.conf, controller-manager.conf, scheduler.conf) embed client certs. Run kubeadm certs renew all and then sudo cp /etc/kubernetes/admin.conf ~/.kube/config. If you only renew the apiserver serving cert, kubeconfig files are unaffected.
